@@ -90,7 +90,7 @@ echo 'press cross; wait 100ms; release cross' | nc IP_TO_PSVITA 1338
 | Command   | Arguments                       | Explanation                  |
 | --------- | ------------------------------- | ---------------------------- |
 | `help`    | none                            | display the help screen      |
-| `install` | `<path to .vpk>` or `- <size>`  | install a VPK that is already on the Vita, e.g. `install ux0:data/app.vpk`, or one sent right after the command |
+| `install` | `- <size>` or `<path to .vpk>`  | install a VPK sent right after the command, or one already on the Vita, e.g. `install ux0:data/app.vpk` |
 | `launch`  | `<TITLEID>`                     | launch an application by id e.g. `launch VHBB00001` to launch the [Vita Homebrew Browser](https://github.com/devnoname120/vhbb) |
 | `nosleep` | `on`, `off` or `status`         | enable or disable automatic suspend prevention. This is enabled by default at boot |
 | `perf`    | none                            | show clocks, per-core CPU load, FPS, the foreground app and battery state, measured over half a second |
@@ -142,23 +142,23 @@ Use `release all` to clear every synthetic button, stick, and touch.
 
 ### Installing a VPK
 
-Upload the VPK over FTP, then ask the command server to install it:
-
-```
-curl -T app.vpk ftp://IP_TO_VITA:1337/ux0:/data/app.vpk
-echo 'install ux0:data/app.vpk' | nc IP_TO_VITA 1338
-```
-
-Or stream it to the command server in one step, without storing the VPK on the
-Vita first. The size tells the Vita where the VPK ends (use `stat -f %z` on
-macOS):
+Stream the VPK to the command server. The size tells the Vita where the VPK
+ends (use `stat -f %z` on macOS):
 
 ```
 { echo "install - $(stat -c %s app.vpk)"; cat app.vpk; } | nc IP_TO_VITA 1338
 ```
 
-Extraction runs while the VPK is still arriving, so streaming is faster for
-large VPKs.
+The VPK is extracted while it is still arriving, so this is the fastest way to
+install, and the memory card doesn't need room for a copy of the VPK.
+
+A VPK that is already on the Vita, for example uploaded over FTP, can be
+installed by path instead:
+
+```
+curl -T app.vpk ftp://IP_TO_VITA:1337/ux0:/data/app.vpk
+echo 'install ux0:data/app.vpk' | nc IP_TO_VITA 1338
+```
 
 The VPK is extracted to `ux0:data/vitacompanion_pkg`, a `head.bin` is
 generated if the VPK doesn't include one, and the package is promoted. An

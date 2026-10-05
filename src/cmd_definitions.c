@@ -26,7 +26,7 @@ static bool validate_wait(char **arg_list, size_t arg_count,
 
 const cmd_definition cmd_definitions[] = {
     {.name = "help", .description = "Display this help screen", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_help},
-    {.name = "install", .description = "Install a VPK from the Vita's storage or sent after the command", .min_arg_count = 1, .max_arg_count = 2, .validator = NULL, .executor = &cmd_install},
+    {.name = "install", .description = "Install a VPK sent after the command, or from a path", .min_arg_count = 1, .max_arg_count = 2, .validator = NULL, .executor = &cmd_install},
     {.name = "launch", .description = "Launch an app by Title ID", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_launch},
     {.name = "nosleep", .description = "Control automatic suspend prevention", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_nosleep},
     {.name = "perf", .description = "Show clocks, CPU load, FPS, app and battery", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_perf},
