@@ -151,8 +151,11 @@ target_link_libraries(vitacompanion
   ${CMAKE_CURRENT_BINARY_DIR}/libvitacompanion_kernel_stub.a
 )
 
+# vita-elf-create appends module data after the code segment. Reserve room
+# for it; otherwise linking fails whenever the code ends just before a 64 KiB
+# boundary ("Cannot allocate N bytes for SCE data at end of segment 0").
 set_target_properties(vitacompanion
-  PROPERTIES LINK_FLAGS "-nostdlib"
+  PROPERTIES LINK_FLAGS "-nostdlib -Wl,--defsym,__sce_headroom=0x4000"
 )
 
 file(READ "${CMAKE_SOURCE_DIR}/vitacompanion.yml" VITACOMPANION_EXPORTS)
