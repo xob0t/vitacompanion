@@ -98,6 +98,7 @@ echo 'press cross; wait 100ms; release cross' | nc IP_TO_PSVITA 1338
 | `reboot`  | none                            | reboot the console           |
 | `release` | input target                    | release one input or all synthetic input |
 | `screen`  | `on` or `off`                   | turn screen on or off        |
+| `screenshot` | optional output path         | save the displayed frame as a BMP, by default to `ux0:data/vitacompanion_screenshot.bmp` |
 | `version` | none                            | display the loaded Vita Companion module version |
 | `wait`    | duration ending in `ms` or `s`  | wait before executing the next chained command |
 
@@ -156,6 +157,20 @@ contain spaces, and ZIP64 or encrypted archives are not supported.
 The command server handles one connection at a time, so other commands wait
 until the installation finishes; large VPKs can take a while. The VPK itself
 is left in place.
+
+### Taking a screenshot
+
+`screenshot` saves the frame currently on the display as a 24-bit BMP. Fetch
+it over FTP afterwards:
+
+```
+echo screenshot | nc IP_TO_VITA 1338
+curl -o shot.bmp ftp://IP_TO_VITA:1337/ux0:/data/vitacompanion_screenshot.bmp
+```
+
+The foreground application's framebuffer is captured. When no application is
+running, the shell's framebuffer is captured instead. The kernel module reads
+the framebuffer, so update both modules together.
  
  **Note**: Commands are defined in [`src/cmd_definitions.c`](https://github.com/robsdedude/vitacompanion/blob/master/src/cmd_definitions.c), you can add new commands there.
  
