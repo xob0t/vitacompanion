@@ -3,6 +3,7 @@
 #include "input.h"
 #include "nosleep.h"
 #include "parser.h"
+#include "perf.h"
 #include "screenshot.h"
 #include "version.h"
 #include "vpk_install.h"
@@ -28,6 +29,7 @@ const cmd_definition cmd_definitions[] = {
     {.name = "install", .description = "Install a VPK from the Vita's storage or sent after the command", .min_arg_count = 1, .max_arg_count = 2, .validator = NULL, .executor = &cmd_install},
     {.name = "launch", .description = "Launch an app by Title ID", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_launch},
     {.name = "nosleep", .description = "Control automatic suspend prevention", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_nosleep},
+    {.name = "perf", .description = "Show clocks, CPU load, FPS, app and battery", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_perf},
     {.name = "press", .description = "Press or position a synthetic input", .min_arg_count = 1, .max_arg_count = 4, .validator = &validate_press, .executor = &cmd_press},
     {.name = "quit", .description = "Quit an app by Title ID, or all apps", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_quit},
     {.name = "reboot", .description = "Reboot the console", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_reboot},
@@ -90,6 +92,13 @@ void cmd_quit(char **arg_list, size_t arg_count, char *res_msg) {
   } else {
     strcpy(res_msg, "Quit.\n");
   }
+}
+
+void cmd_perf(char **arg_list, size_t arg_count, char *res_msg) {
+  (void)arg_list;
+  (void)arg_count;
+
+  perf_format(res_msg, CMD_RESPONSE_MAX);
 }
 
 void cmd_nosleep(char **arg_list, size_t arg_count, char *res_msg) {

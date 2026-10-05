@@ -71,6 +71,7 @@ target_link_libraries(vitacompanion_kernel
   taihenForKernel_stub
   SceCtrlForDriver_stub
   SceDisplayForDriver_stub
+  ScePowerForDriver_stub
   SceSysclibForDriver_stub
   SceSysmemForDriver_stub
   SceThreadmgrForDriver_stub
@@ -106,6 +107,8 @@ add_executable(vitacompanion
         src/input_parse.c
         src/version.c
         src/version.h
+        src/perf.c
+        src/perf.h
         src/vpk_format.c
         src/vpk_format.h
         src/vpk_package.c

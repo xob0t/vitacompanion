@@ -7,6 +7,7 @@
 #include <psp2kern/kernel/sysmem/data_transfers.h>
 #include <psp2kern/kernel/modulemgr.h>
 #include <psp2kern/kernel/threadmgr.h>
+#include <psp2kern/power.h>
 #include <stdint.h>
 #include <string.h>
 #include <taihen.h>
@@ -20,6 +21,9 @@
 #define SCREEN_MAX_WIDTH 1920
 #define SCREEN_MAX_HEIGHT 1088
 #define SCREEN_FRAME_WAIT_US (100 * 1000)
+
+/* In the ScePowerForDriver stubs, but missing from the vita-headers. */
+int kscePowerGetGpuClockFrequencyInternal(int *corefreq, int *mpfreq);
 
 typedef struct {
     int active;
@@ -45,6 +49,7 @@ static uint8_t screen_row[SCREEN_MAX_WIDTH * 4];
 
 static SceUID display_hook_id = -1;
 static tai_hook_ref_t display_hook_ref;
+static volatile uint32_t frame_counts[2];
 
 /*
  * Screenshot handshake with the display hook. The hook copies the next
@@ -547,21 +552,52 @@ out:
 /*
  * Sees every frame submitted to a display, the same hook point PSVshell
  * uses. Index 0 is the foreground application's framebuffer, 1 the shell's.
+ * Frames on the primary display are counted for perf, and a requested
+ * screenshot is copied here.
  */
 static int set_frame_buf_hook(int head, int index,
     const SceDisplayFrameBuf *param, int sync)
 {
-    if (index == capture_index && param && param->base &&
-        head == ksceDisplayGetPrimaryHead() &&
-        __sync_bool_compare_and_swap(&capture_state, CAPTURE_REQUESTED,
-            CAPTURE_COPYING))
+    if ((index == 0 || index == 1) && param && param->base &&
+        head == ksceDisplayGetPrimaryHead())
     {
-        capture_result = copy_submitted_frame(param);
-        __sync_synchronize();
-        capture_state = CAPTURE_DONE;
+        __sync_fetch_and_add(&frame_counts[index], 1);
+
+        if (index == capture_index &&
+            __sync_bool_compare_and_swap(&capture_state, CAPTURE_REQUESTED,
+                CAPTURE_COPYING))
+        {
+            capture_result = copy_submitted_frame(param);
+            __sync_synchronize();
+            capture_state = CAPTURE_DONE;
+        }
     }
 
     return TAI_CONTINUE(int, display_hook_ref, head, index, param, sync);
+}
+
+int vitaCompanionKernelGetPerf(vitacompanion_perf *perf)
+{
+    vitacompanion_perf data;
+    SceDisplayFrameBufInfo frame;
+
+    memset(&data, 0, sizeof(data));
+    data.cpu_mhz = kscePowerGetArmClockFrequency();
+    data.bus_mhz = kscePowerGetBusClockFrequency();
+    kscePowerGetGpuClockFrequencyInternal(&data.gpu_core_mhz,
+        &data.gpu_mp_mhz);
+    data.gpu_xbar_mhz = kscePowerGetGpuXbarClockFrequency();
+    data.frames_counted = display_hook_id >= 0;
+    data.frames[0] = frame_counts[0];
+    data.frames[1] = frame_counts[1];
+
+    memset(&frame, 0, sizeof(frame));
+    frame.size = sizeof(frame);
+    if (ksceDisplayGetProcFrameBufInternal(-1, ksceDisplayGetPrimaryHead(), 0,
+        &frame) >= 0 && frame.paddr != 0)
+        data.app_pid = frame.pid;
+
+    return ksceKernelCopyToUser(perf, &data, sizeof(data));
 }
 
 int module_start(SceSize argc, const void *args)
@@ -624,7 +660,7 @@ int module_start(SceSize argc, const void *args)
         return SCE_KERNEL_START_FAILED;
     }
 
-    /* Optional: without it, screenshots copy the frame as it is. */
+    /* Optional: without it, perf has no FPS and screenshots don't wait. */
     display_hook_id = taiHookFunctionExportForKernel(KERNEL_PID,
         &display_hook_ref, "SceDisplay", 0x9FED47AC, 0x16466675,
         set_frame_buf_hook);

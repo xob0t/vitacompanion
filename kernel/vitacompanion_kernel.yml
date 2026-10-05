@@ -16,3 +16,4 @@ vitacompanion_kernel:
         - vitaCompanionKernelSetTouch
         - vitaCompanionKernelReset
         - vitaCompanionKernelScreenCapture
+        - vitaCompanionKernelGetPerf
