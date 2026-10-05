@@ -25,7 +25,7 @@ static bool validate_wait(char **arg_list, size_t arg_count,
 
 const cmd_definition cmd_definitions[] = {
     {.name = "help", .description = "Display this help screen", .min_arg_count = 0, .max_arg_count = 0, .validator = NULL, .executor = &cmd_help},
-    {.name = "install", .description = "Install a VPK file from the Vita's storage", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_install},
+    {.name = "install", .description = "Install a VPK from the Vita's storage or sent after the command", .min_arg_count = 1, .max_arg_count = 2, .validator = NULL, .executor = &cmd_install},
     {.name = "launch", .description = "Launch an app by Title ID", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_launch},
     {.name = "nosleep", .description = "Control automatic suspend prevention", .min_arg_count = 1, .max_arg_count = 1, .validator = NULL, .executor = &cmd_nosleep},
     {.name = "press", .description = "Press or position a synthetic input", .min_arg_count = 1, .max_arg_count = 4, .validator = &validate_press, .executor = &cmd_press},
@@ -108,18 +108,53 @@ void cmd_nosleep(char **arg_list, size_t arg_count, char *res_msg) {
   }
 }
 
+static bool parse_size(const char *text, uint32_t *size) {
+  uint64_t value = 0;
+
+  if (*text == '\0')
+    return false;
+  for (; *text; ++text) {
+    if (*text < '0' || *text > '9')
+      return false;
+    value = value * 10 + (uint64_t)(*text - '0');
+    if (value > 0xFFFFFFFFu)
+      return false;
+  }
+  *size = (uint32_t)value;
+  return true;
+}
+
 void cmd_install(char **arg_list, size_t arg_count, char *res_msg) {
   char title_id[VPK_TITLE_ID_LENGTH + 1] = {0};
   const char *path = arg_list[1];
+  uint32_t size;
   int result;
 
-  (void)arg_count;
+  if (!strcmp(path, "-")) {
+    if (arg_count != 3 || !parse_size(arg_list[2], &size)) {
+      strcpy(res_msg, "Error: use install - <size in bytes>.\n");
+      return;
+    }
 
-  /* Accept the FTP form /ux0:/... as well as ux0:/... */
-  if (path[0] == '/')
-    path++;
+    /* The VPK follows the request line on the same connection. */
+    result = cmd_payload_start(size);
+    if (result >= 0) {
+      result = vpk_install_from(cmd_payload_read, NULL, title_id);
+      cmd_payload_finish();
+    }
+  } else {
+    if (arg_count != 2) {
+      strcpy(res_msg, "Error: use install <path> or install - <size>.\n");
+      return;
+    }
 
-  result = vpk_install(path, title_id);
+    /* Accept the FTP form /ux0:/... as well as ux0:/... */
+    if (path[0] == '/')
+      path++;
+
+    result = vpk_install(path, title_id);
+  }
+
   if (result < 0)
     vpk_install_format_error(result, res_msg, CMD_RESPONSE_MAX);
   else

@@ -1,4 +1,5 @@
 import hashlib
+import io
 import pathlib
 import random
 import struct
@@ -325,6 +326,19 @@ EXTRACT_PROGRAM = r"""
 #include <stdio.h>
 #include <string.h>
 
+/* Hands out the archive in small, irregular chunks, like a socket. */
+static int read_chunks(void *ctx, void *buffer, unsigned int size)
+{
+    static unsigned int seed = 12345;
+    size_t chunk;
+
+    seed = seed * 1103515245u + 12345u;
+    chunk = 1 + (seed >> 16) % 997;
+    if (chunk > size)
+        chunk = size;
+    return (int)fread(buffer, 1, chunk, (FILE *)ctx);
+}
+
 int main(int argc, char **argv)
 {
     char title_id[VPK_TITLE_ID_LENGTH + 1] = {0};
@@ -339,7 +353,16 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    result = vpk_extract(argv[1], argv[2]);
+    if (!strcmp(argv[1], "stream"))
+    {
+        FILE *f = fopen(argv[2], "rb");
+
+        result = vpk_extract_from(read_chunks, f, argv[3]);
+        fclose(f);
+        argv[2] = argv[3];
+    }
+    else
+        result = vpk_extract(argv[1], argv[2]);
     if (result >= 0)
         result = vpk_prepare_package(argv[2], title_id);
     printf("%d %s\n", result, title_id);
@@ -356,8 +379,9 @@ class VpkInstallTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_extract(self, archive, dest="pkg"):
-        result = compile_and_run(EXTRACT_PROGRAM, self.tmp, archive, dest)
+    def run_extract(self, archive, dest="pkg", stream=False):
+        args = ("stream", archive, dest) if stream else (archive, dest)
+        result = compile_and_run(EXTRACT_PROGRAM, self.tmp, *args)
         self.assertEqual(result.returncode, 0, result.stderr)
         code, _, title_id = result.stdout.strip().partition(" ")
         return int(code), title_id
@@ -528,6 +552,62 @@ class VpkInstallTests(unittest.TestCase):
             (self.tmp / "pkg/sce_sys/package/head.bin").read_bytes(),
             expected_head_bin("VITA00001", "UP0001-VITA00001_00-0000000000000000"),
         )
+
+    def test_extracts_streamed_vpk_in_small_chunks(self):
+        archive, files = self.make_vpk("app.vpk")
+
+        code, title_id = self.run_extract(archive, stream=True)
+
+        self.assertEqual((code, title_id), (0, "VITA00001"))
+        for file_name, data in files.items():
+            self.assertEqual(
+                (self.tmp / "pkg" / file_name).read_bytes(), data, file_name
+            )
+
+    def write_unseekable_zip(self, name, method):
+        """Writes a ZIP whose sizes follow each entry's data."""
+
+        class Unseekable(io.RawIOBase):
+            def __init__(self, raw):
+                self.raw = raw
+
+            def writable(self):
+                return True
+
+            def write(self, data):
+                return self.raw.write(data)
+
+        path = self.tmp / name
+        with open(path, "wb") as raw:
+            with zipfile.ZipFile(Unseekable(raw), "w") as archive:
+                archive.writestr(
+                    zipfile.ZipInfo("sce_sys/"), b"", compress_type=zipfile.ZIP_STORED
+                )
+                for file_name, data in (
+                    ("sce_sys/param.sfo", make_sfo([("TITLE_ID", "VITA00001")])),
+                    ("eboot.bin", bytes(range(256)) * 300),
+                ):
+                    archive.writestr(file_name, data, compress_type=method)
+        return path
+
+    def test_extracts_entries_with_data_descriptors(self):
+        archive = self.write_unseekable_zip("desc.vpk", zipfile.ZIP_DEFLATED)
+        self.assertIn(b"PK\x07\x08", archive.read_bytes())
+
+        for stream in (False, True):
+            dest = "desc_stream" if stream else "desc_file"
+            code, title_id = self.run_extract(archive, dest, stream=stream)
+            self.assertEqual((code, title_id), (0, "VITA00001"))
+            self.assertEqual(
+                (self.tmp / dest / "eboot.bin").read_bytes(), bytes(range(256)) * 300
+            )
+
+    def test_rejects_stored_entries_without_sizes(self):
+        archive = self.write_unseekable_zip("stored.vpk", zipfile.ZIP_STORED)
+
+        code, _ = self.run_extract(archive)
+
+        self.assertEqual(code, -13)
 
     def test_keeps_head_bin_shipped_in_vpk(self):
         archive, _ = self.make_vpk("app.vpk", head_bin=b"original")

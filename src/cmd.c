@@ -38,6 +38,26 @@ static volatile int loader_stopping;
 static volatile int loader_start_state;
 static volatile int reboot_requested;
 
+/* Bytes the client sent after the request line, read by cmd_read_payload. */
+static char payload_buffer[CMD_REQUEST_MAX];
+static unsigned int payload_used;
+static unsigned int payload_length;
+static int payload_socket = -1;
+static bool payload_skip_lf;
+
+#define PAYLOAD_RING_SIZE (1024 * 1024)
+#define PAYLOAD_POLL_US 1000
+
+static struct {
+    SceUID block;
+    uint8_t* ring;
+    SceUID thread;
+    uint32_t size;
+    volatile uint32_t received;
+    volatile uint32_t consumed;
+    volatile int failed;
+} payload_receiver;
+
 typedef struct {
     const cmd_definition* definition;
     char* args[ARG_MAX];
@@ -60,8 +80,12 @@ static int cmd_send_all(int socket, const char* message)
     return (int)sent;
 }
 
+/*
+ * Returns the length of the request line. *total is set to the number of
+ * bytes received, which can include data sent after the line.
+ */
 static int cmd_receive_request(int socket, char* request,
-    unsigned int capacity)
+    unsigned int capacity, unsigned int* total)
 {
     unsigned int used = 0;
 
@@ -72,19 +96,197 @@ static int cmd_receive_request(int socket, char* request,
         unsigned int i;
 
         if (received <= 0)
+        {
+            *total = used;
             return used > 0 ? (int)used : received;
+        }
 
         for (i = 0; i < (unsigned int)received; ++i)
         {
             if (request[used + i] == '\n' ||
                 request[used + i] == '\r')
+            {
+                *total = used + (unsigned int)received;
                 return (int)(used + i + 1);
+            }
         }
 
         used += (unsigned int)received;
     }
 
+    *total = used;
     return (int)used;
+}
+
+/* Reads data that the client sent after the request line. */
+static int cmd_read_payload(void* buffer, unsigned int size)
+{
+    for (;;)
+    {
+        int result;
+
+        if (payload_socket < 0 || size == 0)
+            return -1;
+
+        if (payload_used < payload_length)
+        {
+            unsigned int chunk = payload_length - payload_used;
+
+            if (chunk > size)
+                chunk = size;
+            memcpy(buffer, payload_buffer + payload_used, chunk);
+            payload_used += chunk;
+            result = (int)chunk;
+        }
+        else
+        {
+            result = sceNetRecv(payload_socket, buffer, size, 0);
+            if (result <= 0)
+                return -1;
+        }
+
+        /* A CRLF request line leaves its LF in front of the data. */
+        if (payload_skip_lf)
+        {
+            payload_skip_lf = false;
+            if (((char*)buffer)[0] == '\n')
+            {
+                if (result == 1)
+                    continue;
+                memmove(buffer, (char*)buffer + 1, (size_t)result - 1);
+                result--;
+            }
+        }
+
+        return result;
+    }
+}
+
+/*
+ * A payload is received by its own thread into a ring buffer, so the network
+ * keeps flowing while the command thread writes what it read to storage.
+ * Both sides poll; received and consumed only ever grow.
+ */
+static int payload_thread(SceSize args, void* argp)
+{
+    (void)args;
+    (void)argp;
+
+    while (payload_receiver.received < payload_receiver.size)
+    {
+        uint32_t used = payload_receiver.received - payload_receiver.consumed;
+        uint32_t offset = payload_receiver.received % PAYLOAD_RING_SIZE;
+        uint32_t chunk = PAYLOAD_RING_SIZE - offset;
+        int result;
+
+        if (used == PAYLOAD_RING_SIZE)
+        {
+            sceKernelDelayThread(PAYLOAD_POLL_US);
+            continue;
+        }
+        if (chunk > PAYLOAD_RING_SIZE - used)
+            chunk = PAYLOAD_RING_SIZE - used;
+        if (chunk > payload_receiver.size - payload_receiver.received)
+            chunk = payload_receiver.size - payload_receiver.received;
+
+        result = cmd_read_payload(payload_receiver.ring + offset, chunk);
+        if (result <= 0)
+        {
+            payload_receiver.failed = 1;
+            break;
+        }
+        __sync_synchronize();
+        payload_receiver.received += (uint32_t)result;
+    }
+
+    return sceKernelExitThread(0);
+}
+
+/* Starts receiving size bytes of payload for the current request. */
+int cmd_payload_start(uint32_t size)
+{
+    void* base = NULL;
+    int result;
+
+    payload_receiver.size = size;
+    payload_receiver.received = 0;
+    payload_receiver.consumed = 0;
+    payload_receiver.failed = 0;
+
+    payload_receiver.block = sceKernelAllocMemBlock("vitacompanion_payload",
+        SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, PAYLOAD_RING_SIZE, NULL);
+    if (payload_receiver.block < 0)
+        return payload_receiver.block;
+    result = sceKernelGetMemBlockBase(payload_receiver.block, &base);
+    if (result < 0)
+    {
+        sceKernelFreeMemBlock(payload_receiver.block);
+        return result;
+    }
+    payload_receiver.ring = base;
+
+    payload_receiver.thread = sceKernelCreateThread(
+        "vitacompanion_payload_thread", payload_thread, 0x40, 0x4000, 0, 0,
+        NULL);
+    result = payload_receiver.thread;
+    if (result >= 0)
+    {
+        result = sceKernelStartThread(payload_receiver.thread, 0, NULL);
+        if (result < 0)
+            sceKernelDeleteThread(payload_receiver.thread);
+    }
+    if (result < 0)
+        sceKernelFreeMemBlock(payload_receiver.block);
+    return result;
+}
+
+/* vpk_read_fn over the payload started with cmd_payload_start. */
+int cmd_payload_read(void* ctx, void* buffer, unsigned int size)
+{
+    (void)ctx;
+
+    for (;;)
+    {
+        uint32_t available =
+            payload_receiver.received - payload_receiver.consumed;
+
+        if (available > 0)
+        {
+            uint32_t offset = payload_receiver.consumed % PAYLOAD_RING_SIZE;
+            uint32_t chunk = PAYLOAD_RING_SIZE - offset;
+
+            if (chunk > available)
+                chunk = available;
+            if (chunk > size)
+                chunk = size;
+            __sync_synchronize();
+            memcpy(buffer, payload_receiver.ring + offset, chunk);
+            __sync_synchronize();
+            payload_receiver.consumed += chunk;
+            return (int)chunk;
+        }
+
+        if (payload_receiver.consumed == payload_receiver.size)
+            return 0;
+        if (payload_receiver.failed)
+            return -1;
+        sceKernelDelayThread(PAYLOAD_POLL_US);
+    }
+}
+
+/* Discards the unread rest so the reply reaches the client, then cleans up. */
+void cmd_payload_finish(void)
+{
+    while (payload_receiver.consumed < payload_receiver.size &&
+        !payload_receiver.failed)
+    {
+        payload_receiver.consumed = payload_receiver.received;
+        sceKernelDelayThread(PAYLOAD_POLL_US);
+    }
+
+    sceKernelWaitThreadEnd(payload_receiver.thread, NULL, NULL);
+    sceKernelDeleteThread(payload_receiver.thread);
+    sceKernelFreeMemBlock(payload_receiver.block);
 }
 
 static void response_append(char* response, const char* addition)
@@ -202,6 +404,7 @@ int cmd_thread(unsigned int args, void* argp)
             int timeout_us = CMD_IO_TIMEOUT_US;
             char cmd[CMD_REQUEST_MAX + 1] = { 0 };
             char res_msg[CMD_RES_MAX] = { 0 };
+            unsigned int received = 0;
             int size;
 
             sceNetSetsockopt(client_sockfd, SCE_NET_SOL_SOCKET,
@@ -220,10 +423,15 @@ int cmd_thread(unsigned int args, void* argp)
             sceKernelUnlockMutex(loader_client_mtx, 1);
 
             size = cmd_receive_request(
-                client_sockfd, cmd, CMD_REQUEST_MAX);
+                client_sockfd, cmd, CMD_REQUEST_MAX, &received);
 
             if (size > 0)
             {
+                payload_length = received - (unsigned int)size;
+                memcpy(payload_buffer, cmd + size, payload_length);
+                payload_used = 0;
+                payload_skip_lf = cmd[size - 1] == '\r';
+                payload_socket = client_sockfd;
                 cmd[size] = '\0';
                 if (size == CMD_REQUEST_MAX &&
                     cmd[size - 1] != '\n' &&
@@ -231,6 +439,7 @@ int cmd_thread(unsigned int args, void* argp)
                     strcpy(res_msg, "Error: Command request is too long.\n");
                 else
                     cmd_handle(cmd, (unsigned int)size, res_msg);
+                payload_socket = -1;
             }
 
             if (res_msg[0] != '\0')

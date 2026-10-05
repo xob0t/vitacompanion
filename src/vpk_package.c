@@ -18,11 +18,10 @@
 #define ZIP_LOCAL_HEADER_SIG 0x04034B50
 #define ZIP_CENTRAL_HEADER_SIG 0x02014B50
 #define ZIP_END_SIG 0x06054B50
+#define ZIP_DESCRIPTOR_SIG 0x08074B50
 #define ZIP_LOCAL_HEADER_SIZE 30
-#define ZIP_CENTRAL_HEADER_SIZE 46
-#define ZIP_END_SIZE 22
-#define ZIP_MAX_COMMENT 0xFFFF
 #define ZIP_FLAG_ENCRYPTED 0x0001
+#define ZIP_FLAG_DESCRIPTOR 0x0008
 #define ZIP_METHOD_STORED 0
 #define ZIP_METHOD_DEFLATED 8
 
@@ -34,12 +33,21 @@ typedef struct {
     char path[VPK_PATH_MAX];
 } vpk_work;
 
+/* Archive input, buffered in work->in so it can be read sequentially. */
 typedef struct {
+    vpk_work *work;
+    vpk_read_fn read;
+    void *ctx;
+    size_t pos;
+    size_t length;
+} zip_stream;
+
+typedef struct {
+    uint32_t flags;
     uint32_t method;
     uint32_t crc;
     uint32_t compressed_size;
     uint32_t uncompressed_size;
-    SceOff data_offset;
 } zip_entry;
 
 static uint32_t read_le16(const uint8_t *p)
@@ -73,17 +81,59 @@ static vpk_work *work_alloc(SceUID *block)
     return base;
 }
 
-static int read_at(SceUID fd, void *buffer, SceSize size, SceOff offset)
+/*
+ * Returns 1 when unread input is buffered, 0 at the end of the input. The
+ * buffer is filled completely: a network reader can return a few KiB at a
+ * time, and inflating such small pieces makes for many slow, small writes.
+ */
+static int stream_fill(zip_stream *stream)
 {
-    SceSize done = 0;
+    if (stream->pos < stream->length)
+        return 1;
 
-    while (done < size)
+    stream->pos = 0;
+    stream->length = 0;
+    while (stream->length < VPK_IN_SIZE)
     {
-        int result = sceIoPread(fd, (uint8_t *)buffer + done, size - done,
-            offset + done);
-        if (result <= 0)
+        int result = stream->read(stream->ctx,
+            stream->work->in + stream->length,
+            VPK_IN_SIZE - (unsigned int)stream->length);
+
+        if (result < 0)
             return VPK_ERROR_READ;
-        done += (SceSize)result;
+        if (result == 0)
+            break;
+        stream->length += (size_t)result;
+    }
+
+    return stream->length > 0;
+}
+
+/* Reads exactly size bytes into dst, or skips them when dst is NULL. */
+static int stream_read(zip_stream *stream, void *dst, size_t size)
+{
+    uint8_t *out = dst;
+
+    while (size > 0)
+    {
+        size_t chunk;
+        int result = stream_fill(stream);
+
+        if (result < 0)
+            return result;
+        if (result == 0)
+            return VPK_ERROR_CORRUPT;
+
+        chunk = stream->length - stream->pos;
+        if (chunk > size)
+            chunk = size;
+        if (out)
+        {
+            memcpy(out, stream->work->in + stream->pos, chunk);
+            out += chunk;
+        }
+        stream->pos += chunk;
+        size -= chunk;
     }
 
     return 0;
@@ -188,78 +238,86 @@ int vpk_remove_tree(const char *path)
     return remove_tree_at(buffer, sizeof(buffer));
 }
 
-static int copy_stored(vpk_work *work, SceUID in_fd, SceUID out_fd,
+static int copy_stored(zip_stream *stream, SceUID out_fd,
     const zip_entry *entry, uint32_t *crc)
 {
     uint32_t remaining = entry->compressed_size;
-    SceOff offset = entry->data_offset;
 
     if (entry->compressed_size != entry->uncompressed_size)
         return VPK_ERROR_CORRUPT;
 
     while (remaining > 0)
     {
-        SceSize chunk = remaining < VPK_IN_SIZE ? remaining : VPK_IN_SIZE;
-        int result = read_at(in_fd, work->in, chunk, offset);
+        const uint8_t *data;
+        size_t chunk;
+        int result = stream_fill(stream);
 
         if (result < 0)
             return result;
-        result = write_all(out_fd, work->in, chunk);
+        if (result == 0)
+            return VPK_ERROR_CORRUPT;
+
+        data = stream->work->in + stream->pos;
+        chunk = stream->length - stream->pos;
+        if (chunk > remaining)
+            chunk = remaining;
+
+        result = write_all(out_fd, data, (SceSize)chunk);
         if (result < 0)
             return result;
-
-        *crc = vpk_crc32(*crc, work->in, chunk);
-        offset += chunk;
-        remaining -= chunk;
+        *crc = vpk_crc32(*crc, data, chunk);
+        stream->pos += chunk;
+        remaining -= (uint32_t)chunk;
     }
 
     return 0;
 }
 
-static int inflate_entry(vpk_work *work, SceUID in_fd, SceUID out_fd,
-    const zip_entry *entry, uint32_t *crc)
+/*
+ * Inflates one entry. When the sizes follow the data in a descriptor, the
+ * compressed size is unknown and the end of the deflate stream marks the end
+ * of the entry.
+ */
+static int inflate_entry(zip_stream *stream, SceUID out_fd,
+    const zip_entry *entry, uint32_t *crc, uint32_t *written)
 {
+    vpk_work *work = stream->work;
+    bool sizes_known = !(entry->flags & ZIP_FLAG_DESCRIPTOR);
     uint32_t remaining_in = entry->compressed_size;
-    SceOff offset = entry->data_offset;
-    size_t in_pos = 0;
-    size_t in_available = 0;
     size_t out_pos = 0;
-    uint32_t written = 0;
 
+    *written = 0;
     tinfl_init(&work->inflator);
 
     for (;;)
     {
         size_t in_bytes;
         size_t out_bytes;
+        bool more_input;
         tinfl_status status;
-        int result;
+        int result = stream_fill(stream);
 
-        if (in_available == 0 && remaining_in > 0)
-        {
-            SceSize chunk = remaining_in < VPK_IN_SIZE
-                ? remaining_in : VPK_IN_SIZE;
+        if (result < 0)
+            return result;
 
-            result = read_at(in_fd, work->in, chunk, offset);
-            if (result < 0)
-                return result;
-            offset += chunk;
-            remaining_in -= chunk;
-            in_pos = 0;
-            in_available = chunk;
-        }
+        in_bytes = stream->length - stream->pos;
+        if (sizes_known && in_bytes > remaining_in)
+            in_bytes = remaining_in;
+        more_input = sizes_known ? remaining_in > in_bytes : result > 0;
 
-        in_bytes = in_available;
         out_bytes = VPK_OUT_SIZE - out_pos;
-        status = tinfl_decompress(&work->inflator, work->in + in_pos,
-            &in_bytes, work->out, work->out + out_pos, &out_bytes,
-            remaining_in > 0 ? TINFL_FLAG_HAS_MORE_INPUT : 0);
-        in_pos += in_bytes;
-        in_available -= in_bytes;
+        status = tinfl_decompress(&work->inflator,
+            work->in + stream->pos, &in_bytes, work->out,
+            work->out + out_pos, &out_bytes,
+            more_input ? TINFL_FLAG_HAS_MORE_INPUT : 0);
+        stream->pos += in_bytes;
+        if (sizes_known)
+            remaining_in -= (uint32_t)in_bytes;
 
         if (out_bytes > 0)
         {
-            if (out_bytes > entry->uncompressed_size - written)
+            if (sizes_known &&
+                out_bytes > entry->uncompressed_size - *written)
                 return VPK_ERROR_CORRUPT;
 
             result = write_all(out_fd, work->out + out_pos,
@@ -267,140 +325,170 @@ static int inflate_entry(vpk_work *work, SceUID in_fd, SceUID out_fd,
             if (result < 0)
                 return result;
             *crc = vpk_crc32(*crc, work->out + out_pos, out_bytes);
-            written += (uint32_t)out_bytes;
+            *written += (uint32_t)out_bytes;
             out_pos = (out_pos + out_bytes) & (VPK_OUT_SIZE - 1);
         }
 
         if (status == TINFL_STATUS_DONE)
             break;
         if (status < 0 ||
-            (status == TINFL_STATUS_NEEDS_MORE_INPUT &&
-                in_available == 0 && remaining_in == 0))
+            (status == TINFL_STATUS_NEEDS_MORE_INPUT && !more_input))
             return VPK_ERROR_CORRUPT;
     }
 
-    return written == entry->uncompressed_size ? 0 : VPK_ERROR_CORRUPT;
+    /* Skip anything stored after the end of the deflate stream. */
+    if (sizes_known && remaining_in > 0)
+        return stream_read(stream, NULL, remaining_in);
+
+    return 0;
 }
 
-static int extract_file(vpk_work *work, SceUID in_fd, const zip_entry *entry)
+/* Reads the CRC and sizes that follow the data, signature optional. */
+static int read_descriptor(zip_stream *stream, zip_entry *entry)
+{
+    uint8_t data[16];
+    const uint8_t *fields = data;
+    int result = stream_read(stream, data, 12);
+
+    if (result < 0)
+        return result;
+    if (read_le32(data) == ZIP_DESCRIPTOR_SIG)
+    {
+        result = stream_read(stream, data + 12, 4);
+        if (result < 0)
+            return result;
+        fields = data + 4;
+    }
+
+    entry->crc = read_le32(fields);
+    entry->compressed_size = read_le32(fields + 4);
+    entry->uncompressed_size = read_le32(fields + 8);
+    return 0;
+}
+
+static int extract_file(zip_stream *stream, zip_entry *entry, bool is_dir)
 {
     uint32_t crc = 0;
-    SceUID out_fd;
+    uint32_t written = 0;
     int result;
 
     if (entry->method != ZIP_METHOD_STORED &&
         entry->method != ZIP_METHOD_DEFLATED)
         return VPK_ERROR_METHOD;
 
-    out_fd = sceIoOpen(work->path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
-        0777);
-    if (out_fd < 0)
-        return VPK_ERROR_WRITE;
-
-    if (entry->method == ZIP_METHOD_STORED)
-        result = copy_stored(work, in_fd, out_fd, entry, &crc);
+    if (is_dir)
+    {
+        if (entry->compressed_size != 0)
+            return VPK_ERROR_CORRUPT;
+    }
     else
-        result = inflate_entry(work, in_fd, out_fd, entry, &crc);
+    {
+        SceUID out_fd;
 
-    if (sceIoClose(out_fd) < 0 && result == 0)
-        result = VPK_ERROR_WRITE;
-    if (result == 0 && crc != entry->crc)
-        result = VPK_ERROR_CORRUPT;
-    return result;
+        /* Without its size, the end of uncompressed data cannot be found. */
+        if (entry->method == ZIP_METHOD_STORED &&
+            (entry->flags & ZIP_FLAG_DESCRIPTOR))
+            return VPK_ERROR_NO_SIZES;
+
+        out_fd = sceIoOpen(stream->work->path,
+            SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        if (out_fd < 0)
+            return VPK_ERROR_WRITE;
+
+        if (entry->method == ZIP_METHOD_STORED)
+        {
+            result = copy_stored(stream, out_fd, entry, &crc);
+            written = entry->compressed_size;
+        }
+        else
+            result = inflate_entry(stream, out_fd, entry, &crc, &written);
+
+        if (sceIoClose(out_fd) < 0 && result == 0)
+            result = VPK_ERROR_WRITE;
+        if (result < 0)
+            return result;
+    }
+
+    if (entry->flags & ZIP_FLAG_DESCRIPTOR)
+    {
+        result = read_descriptor(stream, entry);
+        if (result < 0)
+            return result;
+    }
+
+    if (crc != entry->crc || written != entry->uncompressed_size)
+        return VPK_ERROR_CORRUPT;
+    return 0;
 }
 
-static int extract_archive(vpk_work *work, SceUID fd, const char *dest_dir)
+/*
+ * Extracts entries in the order of their local headers, so the archive can
+ * come from a stream. The central directory at the end is not needed.
+ */
+static int extract_entries(zip_stream *stream, const char *dest_dir)
 {
-    uint8_t header[ZIP_CENTRAL_HEADER_SIZE];
-    const uint8_t *end = NULL;
-    SceOff file_size;
-    SceOff tail_size;
-    SceOff position;
-    SceOff central_end;
-    uint32_t entry_count;
-    uint32_t index;
+    vpk_work *work = stream->work;
+    uint8_t header[ZIP_LOCAL_HEADER_SIZE];
     size_t dest_length = strlen(dest_dir);
-    long i;
+    bool first = true;
     int result;
-
-    file_size = sceIoLseek(fd, 0, SCE_SEEK_END);
-    if (file_size < ZIP_END_SIZE)
-        return VPK_ERROR_NOT_ZIP;
-
-    tail_size = file_size < ZIP_END_SIZE + ZIP_MAX_COMMENT
-        ? file_size : ZIP_END_SIZE + ZIP_MAX_COMMENT;
-    result = read_at(fd, work->in, (SceSize)tail_size, file_size - tail_size);
-    if (result < 0)
-        return result;
-
-    for (i = (long)tail_size - ZIP_END_SIZE; i >= 0; --i)
-    {
-        if (read_le32(work->in + i) == ZIP_END_SIG)
-        {
-            end = work->in + i;
-            break;
-        }
-    }
-    if (!end)
-        return VPK_ERROR_NOT_ZIP;
-
-    entry_count = read_le16(end + 10);
-    position = read_le32(end + 16);
-    central_end = position + read_le32(end + 12);
-    if (entry_count == 0xFFFF || read_le32(end + 12) == 0xFFFFFFFF ||
-        read_le32(end + 16) == 0xFFFFFFFF)
-        return VPK_ERROR_ZIP64;
-    if (central_end > file_size)
-        return VPK_ERROR_CORRUPT;
 
     if (dest_length + 2 >= VPK_PATH_MAX)
         return VPK_ERROR_BAD_ENTRY;
     strcpy(work->path, dest_dir);
     make_dirs(work->path, true);
 
-    for (index = 0; index < entry_count; ++index)
+    for (;;)
     {
-        uint32_t flags;
+        zip_entry entry;
+        uint32_t signature;
         uint32_t name_length;
         size_t path_length;
-        zip_entry entry;
-        uint8_t local[ZIP_LOCAL_HEADER_SIZE];
-        SceOff local_offset;
+        bool is_dir;
 
-        if (position + ZIP_CENTRAL_HEADER_SIZE > central_end)
-            return VPK_ERROR_CORRUPT;
-        result = read_at(fd, header, sizeof(header), position);
+        result = stream_read(stream, header, 4);
+        if (result < 0)
+            return first && result == VPK_ERROR_CORRUPT
+                ? VPK_ERROR_NOT_ZIP : result;
+
+        signature = read_le32(header);
+        if (!first && (signature == ZIP_CENTRAL_HEADER_SIG ||
+            signature == ZIP_END_SIG))
+            return 0;
+        if (signature != ZIP_LOCAL_HEADER_SIG)
+            return first ? VPK_ERROR_NOT_ZIP : VPK_ERROR_CORRUPT;
+        first = false;
+
+        result = stream_read(stream, header + 4,
+            ZIP_LOCAL_HEADER_SIZE - 4);
         if (result < 0)
             return result;
-        if (read_le32(header) != ZIP_CENTRAL_HEADER_SIG)
-            return VPK_ERROR_CORRUPT;
 
-        flags = read_le16(header + 8);
-        entry.method = read_le16(header + 10);
-        entry.crc = read_le32(header + 16);
-        entry.compressed_size = read_le32(header + 20);
-        entry.uncompressed_size = read_le32(header + 24);
-        name_length = read_le16(header + 28);
-        local_offset = read_le32(header + 42);
+        entry.flags = read_le16(header + 6);
+        entry.method = read_le16(header + 8);
+        entry.crc = read_le32(header + 14);
+        entry.compressed_size = read_le32(header + 18);
+        entry.uncompressed_size = read_le32(header + 22);
+        name_length = read_le16(header + 26);
 
-        if (entry.compressed_size == 0xFFFFFFFF ||
-            entry.uncompressed_size == 0xFFFFFFFF ||
-            local_offset == 0xFFFFFFFF)
+        if (entry.flags & ZIP_FLAG_ENCRYPTED)
+            return VPK_ERROR_ENCRYPTED;
+        if (!(entry.flags & ZIP_FLAG_DESCRIPTOR) &&
+            (entry.compressed_size == 0xFFFFFFFF ||
+                entry.uncompressed_size == 0xFFFFFFFF))
             return VPK_ERROR_ZIP64;
         if (name_length == 0 ||
             dest_length + 1 + name_length >= VPK_PATH_MAX)
             return VPK_ERROR_BAD_ENTRY;
 
-        result = read_at(fd, work->name, name_length,
-            position + ZIP_CENTRAL_HEADER_SIZE);
+        result = stream_read(stream, work->name, name_length);
         if (result < 0)
             return result;
         work->name[name_length] = '\0';
-        position += ZIP_CENTRAL_HEADER_SIZE + name_length +
-            read_le16(header + 30) + read_le16(header + 32);
+        result = stream_read(stream, NULL, read_le16(header + 28));
+        if (result < 0)
+            return result;
 
-        if (flags & ZIP_FLAG_ENCRYPTED)
-            return VPK_ERROR_ENCRYPTED;
         if (strlen(work->name) != name_length ||
             !vpk_entry_name_normalize(work->name))
             return VPK_ERROR_BAD_ENTRY;
@@ -410,55 +498,57 @@ static int extract_archive(vpk_work *work, SceUID fd, const char *dest_dir)
         work->path[dest_length] = '/';
         memcpy(work->path + dest_length + 1, work->name, name_length + 1);
         path_length = dest_length + 1 + name_length;
-        if (work->path[path_length - 1] == '/')
+        is_dir = work->path[path_length - 1] == '/';
+        if (is_dir)
         {
             work->path[path_length - 1] = '\0';
             make_dirs(work->path, true);
-            continue;
         }
-        make_dirs(work->path, false);
+        else
+            make_dirs(work->path, false);
 
-        result = read_at(fd, local, sizeof(local), local_offset);
-        if (result < 0)
-            return result;
-        if (read_le32(local) != ZIP_LOCAL_HEADER_SIG)
-            return VPK_ERROR_CORRUPT;
-
-        entry.data_offset = local_offset + ZIP_LOCAL_HEADER_SIZE +
-            read_le16(local + 26) + read_le16(local + 28);
-        if (entry.data_offset + entry.compressed_size > file_size)
-            return VPK_ERROR_CORRUPT;
-
-        result = extract_file(work, fd, &entry);
+        result = extract_file(stream, &entry, is_dir);
         if (result < 0)
             return result;
     }
+}
 
-    return 0;
+int vpk_extract_from(vpk_read_fn read, void *ctx, const char *dest_dir)
+{
+    zip_stream stream;
+    SceUID block;
+    int result;
+
+    memset(&stream, 0, sizeof(stream));
+    stream.work = work_alloc(&block);
+    if (!stream.work)
+        return VPK_ERROR_NO_MEMORY;
+    stream.read = read;
+    stream.ctx = ctx;
+
+    result = extract_entries(&stream, dest_dir);
+
+    sceKernelFreeMemBlock(block);
+    return result;
+}
+
+static int read_file(void *ctx, void *buffer, unsigned int size)
+{
+    return sceIoRead(*(SceUID *)ctx, buffer, size);
 }
 
 int vpk_extract(const char *vpk_path, const char *dest_dir)
 {
-    SceUID block;
     SceUID fd;
-    vpk_work *work;
     int result;
-
-    work = work_alloc(&block);
-    if (!work)
-        return VPK_ERROR_NO_MEMORY;
 
     fd = sceIoOpen(vpk_path, SCE_O_RDONLY, 0);
     if (fd < 0)
-    {
-        sceKernelFreeMemBlock(block);
         return VPK_ERROR_OPEN;
-    }
 
-    result = extract_archive(work, fd, dest_dir);
+    result = vpk_extract_from(read_file, &fd, dest_dir);
 
     sceIoClose(fd);
-    sceKernelFreeMemBlock(block);
     return result;
 }
 
@@ -561,6 +651,8 @@ const char *vpk_error_string(int error)
         return "missing or invalid sce_sys/param.sfo";
     case VPK_ERROR_TITLE_ID:
         return "invalid TITLE_ID in param.sfo";
+    case VPK_ERROR_NO_SIZES:
+        return "uncompressed entry without sizes in its local header";
     default:
         return NULL;
     }

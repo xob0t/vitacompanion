@@ -16,9 +16,14 @@
 #define VPK_ERROR_CORRUPT -10
 #define VPK_ERROR_PARAM_SFO -11
 #define VPK_ERROR_TITLE_ID -12
+#define VPK_ERROR_NO_SIZES -13
+
+/* Reads up to size bytes; returns the count, 0 at the end, < 0 on error. */
+typedef int (*vpk_read_fn)(void *ctx, void *buffer, unsigned int size);
 
 int vpk_remove_tree(const char *path);
 int vpk_extract(const char *vpk_path, const char *dest_dir);
+int vpk_extract_from(vpk_read_fn read, void *ctx, const char *dest_dir);
 int vpk_prepare_package(const char *pkg_dir,
     char title_id[VPK_TITLE_ID_LENGTH + 1]);
 const char *vpk_error_string(int error);

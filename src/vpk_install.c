@@ -48,15 +48,11 @@ static int promote_package(const char *path)
     return result;
 }
 
-int vpk_install(const char *vpk_path,
+/* Installs what was extracted to VPK_PACKAGE_DIR, then removes it. */
+static int install_extracted(int result,
     char title_id[VPK_TITLE_ID_LENGTH + 1])
 {
-    int result;
-
-    vpk_remove_tree(VPK_PACKAGE_DIR);
-
-    result = vpk_extract(vpk_path, VPK_PACKAGE_DIR);
-    LOG("vpk_extract: 0x%08X\n", result);
+    LOG("extract: 0x%08X\n", result);
     if (result >= 0)
         result = vpk_prepare_package(VPK_PACKAGE_DIR, title_id);
 
@@ -70,6 +66,22 @@ int vpk_install(const char *vpk_path,
 
     vpk_remove_tree(VPK_PACKAGE_DIR);
     return result;
+}
+
+int vpk_install(const char *vpk_path,
+    char title_id[VPK_TITLE_ID_LENGTH + 1])
+{
+    vpk_remove_tree(VPK_PACKAGE_DIR);
+    return install_extracted(vpk_extract(vpk_path, VPK_PACKAGE_DIR),
+        title_id);
+}
+
+int vpk_install_from(vpk_read_fn read, void *ctx,
+    char title_id[VPK_TITLE_ID_LENGTH + 1])
+{
+    vpk_remove_tree(VPK_PACKAGE_DIR);
+    return install_extracted(vpk_extract_from(read, ctx, VPK_PACKAGE_DIR),
+        title_id);
 }
 
 int vpk_install_format_error(int error, char *buffer, size_t buffer_size)

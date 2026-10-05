@@ -90,7 +90,7 @@ echo 'press cross; wait 100ms; release cross' | nc IP_TO_PSVITA 1338
 | Command   | Arguments                       | Explanation                  |
 | --------- | ------------------------------- | ---------------------------- |
 | `help`    | none                            | display the help screen      |
-| `install` | `<path to .vpk>`                | install a VPK that is already on the Vita, e.g. `install ux0:data/app.vpk` |
+| `install` | `<path to .vpk>` or `- <size>`  | install a VPK that is already on the Vita, e.g. `install ux0:data/app.vpk`, or one sent right after the command |
 | `launch`  | `<TITLEID>`                     | launch an application by id e.g. `launch VHBB00001` to launch the [Vita Homebrew Browser](https://github.com/devnoname120/vhbb) |
 | `nosleep` | `on`, `off` or `status`         | enable or disable automatic suspend prevention. This is enabled by default at boot |
 | `press`   | input target and values         | press a button, position a stick, or start/update a touch |
@@ -148,14 +148,26 @@ curl -T app.vpk ftp://IP_TO_VITA:1337/ux0:/data/app.vpk
 echo 'install ux0:data/app.vpk' | nc IP_TO_VITA 1338
 ```
 
+Or stream it to the command server in one step, without storing the VPK on the
+Vita first. The size tells the Vita where the VPK ends (use `stat -f %z` on
+macOS):
+
+```
+{ echo "install - $(stat -c %s app.vpk)"; cat app.vpk; } | nc IP_TO_VITA 1338
+```
+
+Extraction runs while the VPK is still arriving, so streaming is faster for
+large VPKs.
+
 The VPK is extracted to `ux0:data/vitacompanion_pkg`, a `head.bin` is
 generated if the VPK doesn't include one, and the package is promoted. An
 installed application with the same title ID is updated, and quit first if it
 is running. The reply is `Installed TITLEID.` or an error. Paths cannot
-contain spaces, and ZIP64 or encrypted archives are not supported.
+contain spaces. ZIP64 and encrypted archives are not supported, nor are
+uncompressed entries whose sizes only follow their data.
 
 The command server handles one connection at a time, so other commands wait
-until the installation finishes; large VPKs can take a while. The VPK itself
+until the installation finishes; large VPKs can take a while. An uploaded VPK
 is left in place.
 
 ### Taking a screenshot
